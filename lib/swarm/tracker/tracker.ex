@@ -349,14 +349,16 @@ defmodule Swarm.Tracker do
           # missing local registration
           debug "local tracker is missing #{inspect rname}, adding to registry"
           ref = Process.monitor(rpid)
-          Registry.new!(entry(name: rname, pid: rpid, ref: ref, meta: rmeta, clock: rclock))
-          %{state | clock: Clock.event(clock)}
+          nclock = Clock.join(sync_clock, rclock)
+          Registry.new!(entry(name: rname, pid: rpid, ref: ref, meta: rmeta, clock: nclock))
+          %{state | clock: nclock}
         entry(pid: ^rpid, meta: ^rmeta, clock: ^rclock) ->
           # this entry matches, nothing to do
           state
         entry(pid: ^rpid, meta: ^rmeta, clock: _) ->
           # the clocks differ, but the data is identical, so let's update it so they're the same
-          Registry.update(rname, clock: rclock)
+          nclock = Clock.join(sync_clock, rclock)
+          Registry.update(rname, clock: nclock)
           state
         entry(pid: ^rpid, meta: lmeta, clock: lclock) ->
           # the metadata differs, we need to merge it
@@ -364,7 +366,8 @@ defmodule Swarm.Tracker do
             :lt ->
               # the remote clock dominates, so merge favoring data from the remote registry
               new_meta = Map.merge(lmeta, rmeta)
-              Registry.update(rname, clock: Clock.event(rclock), meta: new_meta)
+              nclock = Clock.join(lclock, rclock)
+              Registry.update(rname, clock: nclock, meta: new_meta)
             :gt ->
               # the local clock dominates, so merge favoring data from the local registry
               new_meta = Map.merge(rmeta, lmeta)
@@ -378,7 +381,8 @@ defmodule Swarm.Tracker do
                 :lt ->
                   # merge favoring remote, use remote clock as new entry clock
                   new_meta = Map.merge(lmeta, rmeta)
-                  Registry.update(rname, clock: sync_clock, meta: new_meta)
+                  nclock = Clock.join(lclock, rclock)
+                  Registry.update(rname, clock: nclock, meta: new_meta)
                 :gt ->
                   # merge favoring local, use local clock as new entry clock
                   new_meta = Map.merge(rmeta, lmeta)
@@ -651,13 +655,13 @@ defmodule Swarm.Tracker do
           GenServer.cast(pid, {:swarm, :end_handoff, handoff_state})
           ref = Process.monitor(pid)
           new_clock = Clock.event(clock)
-          Registry.new!(entry(name: name, pid: pid, ref: ref, meta: meta, clock: Clock.peek(new_clock)))
-          broadcast_event(state.nodes, Clock.peek(new_clock), {:track, name, pid, meta})
+          Registry.new!(entry(name: name, pid: pid, ref: ref, meta: meta, clock: new_clock))
+          broadcast_event(state.nodes, new_clock, {:track, name, pid, meta})
           {:keep_state, %{state | clock: new_clock}}
         entry(pid: pid) when node(pid) == current_node ->
           GenServer.cast(pid, {:swarm, :resolve_conflict, handoff_state})
           new_clock = Clock.event(clock)
-          broadcast_event(state.nodes, Clock.peek(new_clock), {:track, name, pid, meta})
+          broadcast_event(state.nodes, new_clock, {:track, name, pid, meta})
           {:keep_state, %{state | clock: new_clock}}
         entry(pid: pid, ref: ref) = obj when node(pid) == node(from) ->
           # We have received the handoff before we've received the untrack event, but because
@@ -776,14 +780,14 @@ defmodule Swarm.Tracker do
       entry(name: ^name, pid: ^pid, meta: lmeta) ->
         # We don't have the same view of the metadata
         cond do
-          Clock.leq(clock, rclock) ->
+          Clock.leq(clock, rclock) ->            
             # The remote version is dominant
             Registry.update(name, meta: Map.merge(lmeta, meta))
-            {:keep_state, %{state | clock: Clock.event(clock)}}
+            nclock = Clock.join(clock, rclock)
+            {:keep_state, %{state | clock: nclock}}
           Clock.leq(rclock, clock) ->
             # The local version is dominant
-            Registry.update(name, meta: Map.merge(meta, lmeta))
-            {:keep_state, %{state | clock: Clock.event(clock)}}
+            :keep_state_and_data
           :else ->
             warn "received track event for #{inspect name}, but local clock conflicts with remote clock, event unhandled"
             :keep_state_and_data
@@ -798,8 +802,9 @@ defmodule Swarm.Tracker do
             Process.exit(other_pid, :kill)
             Registry.remove(obj)
             new_ref = Process.monitor(pid)
-            Registry.new!(entry(name: name, pid: pid, ref: new_ref, meta: meta, clock: rclock))
-            {:keep_state, %{state | clock: Clock.event(clock)}}
+            nclock = Clock.join(clock, rclock)
+            Registry.new!(entry(name: name, pid: pid, ref: new_ref, meta: meta, clock: nclock))
+            {:keep_state, %{state | clock: nclock}}
           Clock.leq(rclock, clock) ->
             # The local version is dominant, so ignore this event
             :keep_state_and_data
@@ -811,8 +816,9 @@ defmodule Swarm.Tracker do
         end
       :undefined ->
         ref = Process.monitor(pid)
-        Registry.new!(entry(name: name, pid: pid, ref: ref, meta: meta, clock: rclock))
-        {:keep_state, %{state | clock: Clock.event(clock)}}
+        nclock = Clock.join(clock, rclock)
+        Registry.new!(entry(name: name, pid: pid, ref: ref, meta: meta, clock: nclock))
+        {:keep_state, %{state | clock: nclock}}
     end
   end
   defp handle_replica_event(_from, {:untrack, pid}, rclock, %TrackerState{clock: clock} = state) do
@@ -827,49 +833,14 @@ defmodule Swarm.Tracker do
               # registration came before unregister, so remove the registration
               Process.demonitor(ref, [:flush])
               Registry.remove(obj)
-              Clock.event(nclock)
+              nclock = Clock.join(lclock, rclock)
+              nclock
             Clock.leq(rclock, lclock) ->
               # registration is newer than de-registration, ignore msg
               debug "untrack is causally dominated by track for #{inspect pid}, ignoring.."
               nclock
             :else ->
               debug "untrack is causally conflicted with track for #{inspect pid}, ignoring.."
-              nclock
-          end
-        end)
-        {:keep_state, %{state | clock: new_clock}}
-    end
-  end
-  defp handle_replica_event(_from, {:add_meta, key, value, pid}, rclock, %TrackerState{clock: clock} = state) do
-    debug "replica event: add_meta #{inspect {key, value}} to #{inspect pid}"
-    case Registry.get_by_pid(pid) do
-      :undefined ->
-        :keep_state_and_data
-      entries when is_list(entries) ->
-        new_clock = Enum.reduce(entries, clock, fn entry(name: name, meta: old_meta, clock: lclock), nclock ->
-          cond do
-            Clock.leq(lclock, rclock) ->
-              new_meta = Map.put(old_meta, key, value)
-              Registry.update(name, [meta: new_meta, clock: rclock])
-              nclock = Clock.event(nclock)
-            Clock.leq(rclock, lclock) ->
-              cond do
-                Map.has_key?(old_meta, key) ->
-                  debug "request to add meta to #{inspect pid} (#{inspect {key, value}}) is causally dominated by local, ignoring.."
-                  nclock
-                :else ->
-                  new_meta = Map.put(old_meta, key, value)
-                  Registry.update(name, [meta: new_meta, clock: rclock])
-                  nclock = Clock.event(nclock)
-              end
-            :else ->
-              # we're going to take the last-writer wins approach for resolution for now
-              new_meta = Map.merge(old_meta, %{key => value})
-              # we're going to keep our local clock though and re-broadcast the update to ensure we converge
-              nclock = Clock.event(clock)
-              Registry.update(name, [meta: new_meta, clock: Clock.peek(nclock)])
-              debug "conflicting meta for #{inspect name}, updating and notifying other nodes"
-              broadcast_event(state.nodes, Clock.peek(nclock), {:update_meta, new_meta, pid})
               nclock
           end
         end)
@@ -885,49 +856,23 @@ defmodule Swarm.Tracker do
         new_clock = Enum.reduce(entries, clock, fn entry(name: name, meta: old_meta, clock: lclock), nclock ->
           cond do
             Clock.leq(lclock, rclock) ->
-              meta = Map.merge(old_meta, new_meta)
-              Registry.update(name, [meta: meta, clock: rclock])
-              Clock.event(nclock)
+              nclock = Clock.join(lclock, rclock)
+              Registry.update(name, [meta: new_meta, clock: nclock])
+              debug "request to update meta from #{inspect pid} (#{inspect new_meta}) is causally dominated by remote, updated registry..."
+              nclock
             Clock.leq(rclock, lclock) ->
-              meta = Map.merge(new_meta, old_meta)
-              Registry.update(name, [meta: meta, clock: rclock])
-              Clock.event(nclock)
+              # ignore the request, as the local clock dominates the remote
+              debug "request to update meta from #{inspect pid} (#{inspect new_meta}) is causally dominated by local, ignoring.."
+              nclock
             :else ->
               # we're going to take the last-writer wins approach for resolution for now
               new_meta = Map.merge(old_meta, new_meta)
-              # we're going to keep our local clock though and re-broadcast the update to ensure we converge
+              # we're going to join and bump our local clock though and re-broadcast the update to ensure we converge              
+              debug "conflicting meta for #{inspect name}, updating and notifying other nodes, old meta: #{inspect old_meta}, new meta: #{inspect new_meta}"
+              nclock = Clock.join(lclock, rclock)
               nclock = Clock.event(nclock)
-              Registry.update(name, [meta: new_meta, clock: Clock.peek(nclock)])
-              debug "conflicting meta for #{inspect name}, updating and notifying other nodes"
-              broadcast_event(state.nodes, Clock.peek(nclock), {:update_meta, new_meta, pid})
-              nclock
-          end
-        end)
-        {:keep_state, %{state | clock: new_clock}}
-    end
-  end
-  defp handle_replica_event(_from, {:remove_meta, key, pid}, rclock, %TrackerState{clock: clock} = state) do
-    debug "replica event: remove_meta #{inspect key} from #{inspect pid}"
-    case Registry.get_by_pid(pid) do
-      :undefined ->
-        :keep_state_and_data
-      entries when is_list(entries) ->
-        new_clock = Enum.reduce(entries, clock, fn entry(name: name, meta: meta, clock: lclock), nclock ->
-          cond do
-            Clock.leq(lclock, rclock) ->
-              new_meta = Map.drop(meta, [key])
-              Registry.update(name, [meta: new_meta, clock: rclock])
-              Clock.event(nclock)
-            Clock.leq(rclock, lclock) and Map.has_key?(meta, key) ->
-              # ignore the request, as the local clock dominates the remote
-              nclock
-            Clock.leq(rclock, lclock) ->
-              # local dominates the remote, but the key is not present anyway
-              nclock
-            Map.has_key?(meta, key) ->
-              warn "received remove_meta event, but local clock conflicts with remote clock, event unhandled"
-              nclock
-            :else ->
+              Registry.update(name, [meta: new_meta, clock: nclock])
+              broadcast_event(state.nodes, nclock, {:update_meta, new_meta, pid})
               nclock
           end
         end)
@@ -1166,6 +1111,7 @@ defmodule Swarm.Tracker do
 
   defp broadcast_event([], _clock, _event),  do: :ok
   defp broadcast_event(nodes, clock, event) do
+    clock = Clock.peek(clock)
     case :rpc.sbcast(nodes, __MODULE__, {:event, self(), clock, event}) do
       {_good, []}  -> :ok
       {_good, bad_nodes} ->
@@ -1192,8 +1138,8 @@ defmodule Swarm.Tracker do
       :undefined ->
         ref = Process.monitor(pid)
         clock = Clock.event(clock)
-        Registry.new!(entry(name: name, pid: pid, ref: ref, meta: meta, clock: Clock.peek(clock)))
-        broadcast_event(nodes, Clock.peek(clock), {:track, name, pid, meta})
+        Registry.new!(entry(name: name, pid: pid, ref: ref, meta: meta, clock: clock))
+        broadcast_event(nodes, clock, {:track, name, pid, meta})
         {:ok, pid, %{state | clock: clock}}
       entry(pid: ^pid) ->
         # Not sure how this could happen, but hey, no need to return an error
@@ -1221,22 +1167,22 @@ defmodule Swarm.Tracker do
     Process.demonitor(ref, [:flush])
     Registry.remove(obj)
     clock = Clock.event(clock)
-    broadcast_event(state.nodes, Clock.peek(clock), {:untrack, pid})
+    broadcast_event(state.nodes, clock, {:untrack, pid})
     {:ok, %{state | clock: clock}}
   end
 
   defp remove_registration_by_pid(pid, %TrackerState{clock: clock} = state) do
     case Registry.get_by_pid(pid) do
       :undefined ->
-        broadcast_event(state.nodes, Clock.peek(clock), {:untrack, pid})
+        broadcast_event(state.nodes, clock, {:untrack, pid})
         {:ok, state}
       entries when is_list(entries) ->
-        new_clock = Enum.reduce(entries, clock, fn entry(ref: ref) = obj, nclock ->
+        new_clock = Enum.reduce(entries, clock, fn entry(ref: ref, clock: lclock) = obj, nclock ->
           Process.demonitor(ref, [:flush])
           Registry.remove(obj)
-          nclock = Clock.event(nclock)
-          broadcast_event(state.nodes, Clock.peek(nclock), {:untrack, pid})
-          nclock
+          lclock = Clock.event(lclock)
+          broadcast_event(state.nodes, lclock, {:untrack, pid})
+          Clock.event(nclock)
         end)
         {:ok, %{state | clock: new_clock}}
     end
@@ -1245,15 +1191,14 @@ defmodule Swarm.Tracker do
   defp add_meta_by_pid({key, value}, pid, %TrackerState{clock: clock} = state) do
     case Registry.get_by_pid(pid) do
       :undefined ->
-        broadcast_event(state.nodes, Clock.peek(clock), {:add_meta, key, value, pid})
         {:ok, state}
       entries when is_list(entries) ->
-        new_clock = Enum.reduce(entries, clock, fn entry(name: name, meta: old_meta), nclock ->
+        new_clock = Enum.reduce(entries, clock, fn entry(name: name, meta: old_meta, clock: lclock), nclock ->
           new_meta = Map.put(old_meta, key, value)
-          nclock = Clock.event(nclock)
-          Registry.update(name, [meta: new_meta, clock: Clock.peek(nclock)])
-          broadcast_event(state.nodes, Clock.peek(nclock), {:add_meta, key, value, pid})
-          nclock
+          lclock = Clock.event(lclock)
+          Registry.update(name, [meta: new_meta, clock: lclock])
+          broadcast_event(state.nodes, lclock, {:update_meta, new_meta, pid})
+          Clock.event(nclock)
         end)
         {:ok, %{state | clock: new_clock}}
     end
@@ -1262,15 +1207,14 @@ defmodule Swarm.Tracker do
   defp remove_meta_by_pid(key, pid, %TrackerState{clock: clock} = state) do
     case Registry.get_by_pid(pid) do
       :undefined ->
-        broadcast_event(state.nodes, Clock.peek(clock), {:remove_meta, key, pid})
         {:ok, state}
       entries when is_list(entries) ->
-        new_clock = Enum.reduce(entries, clock, fn entry(name: name, meta: old_meta), nclock ->
+        new_clock = Enum.reduce(entries, clock, fn entry(name: name, meta: old_meta, clock: lclock), nclock ->
           new_meta = Map.drop(old_meta, [key])
-          nclock = Clock.event(nclock)
-          Registry.update(name, [meta: new_meta, clock: Clock.peek(nclock)])
-          broadcast_event(state.nodes, Clock.peek(nclock), {:remove_meta, key, pid})
-          nclock
+          lclock = Clock.event(lclock)
+          Registry.update(name, [meta: new_meta, clock: lclock])
+          broadcast_event(state.nodes, lclock, {:update_meta, new_meta, pid})
+          Clock.event(nclock)
         end)
         {:ok, %{state | clock: new_clock}}
     end
@@ -1301,13 +1245,14 @@ defmodule Swarm.Tracker do
   end
 
   # Used during anti-entropy checks to remove local registrations and replace them with the remote version
-  defp resolve_incorrect_local_reg(_remote_node, entry(pid: lpid) = lreg, entry(name: rname, pid: rpid, meta: rmeta, clock: rclock), state) do
+  defp resolve_incorrect_local_reg(_remote_node, entry(pid: lpid, clock: lclock) = lreg, entry(name: rname, pid: rpid, meta: rmeta, clock: rclock), state) do
     # the remote registration is correct
     {:ok, new_state} = remove_registration(lreg, state)
     send(lpid, {:swarm, :die})
     # add the remote registration
     ref = Process.monitor(rpid)
-    Registry.new!(entry(name: rname, pid: rpid, ref: ref, meta: rmeta, clock: rclock))
+    nclock = Clock.join(lclock, rclock)
+    Registry.new!(entry(name: rname, pid: rpid, ref: ref, meta: rmeta, clock: nclock))
     new_state
   end
 
