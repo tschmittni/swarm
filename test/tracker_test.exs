@@ -24,7 +24,7 @@ defmodule Swarm.TrackerTests do
   end
 
   test "handle_replica_event :track with no existing registration", %{name: name, pid: pid, meta: meta, rclock: rclock} do
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:track, name, pid, meta}})
+    send_and_wait(rclock, {:track, name, pid, meta})
 
     assert ^pid = Registry.whereis(name)
     assert Enum.member?(Registry.all(), {name, pid})
@@ -37,39 +37,39 @@ defmodule Swarm.TrackerTests do
   end
 
   test "handle_replica_event :track with existing registration, ignores the event", %{name: name, pid: pid, meta: meta, lclock: lclock, rclock: rclock} do
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(lclock), {:track, name, pid, meta}})
+    send_and_wait(lclock, {:track, name, pid, meta})
 
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:track, name, pid, meta}})
+    send_and_wait(rclock, {:track, name, pid, meta})
 
     assert entry(name: _, pid: ^pid, ref: _, meta: _, clock: _) = Registry.get_by_name(name)
   end
 
   test "handle_replica_event :track with conflicting metadata and remote clock dominates, updates the metadata", %{name: name, pid: pid, meta: meta, lclock: lclock, rclock: rclock} do
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(lclock), {:track, name, pid, meta}})
+    send_and_wait(lclock, {:track, name, pid, meta})
 
     rclock = Clock.event(rclock)
     remote_meta = %{other: "meta"}
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:track, name, pid, remote_meta}})
+    send_and_wait(rclock, {:track, name, pid, remote_meta})
 
     assert entry(name: _, pid: ^pid, ref: _, meta: ^remote_meta, clock: _) = Registry.get_by_name(name)
   end
 
   test "handle_replica_event :track with conflicting metadata and local clock dominates, keeps the metadata", %{name: name, pid: pid, meta: meta, lclock: lclock, rclock: rclock} do
     lclock = Clock.event(lclock)
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(lclock), {:track, name, pid, meta}})
+    send_and_wait(lclock, {:track, name, pid, meta})
 
     remote_meta = %{other: "meta"}
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:track, name, pid, remote_meta}})
+    send_and_wait(rclock, {:track, name, pid, remote_meta})
 
     assert entry(name: _, pid: ^pid, ref: _, meta: ^meta, clock: _) = Registry.get_by_name(name)
   end
 
   test "handle_replica_event :track with conflicting pid and remote clock dominates, kills the locally registered pid", %{name: name, pid: pid, meta: meta, lclock: lclock, rclock: rclock} do
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(lclock), {:track, name, pid, meta}})
+    send_and_wait(lclock, {:track, name, pid, meta})
 
     rclock = Clock.event(rclock)
     {:ok, other_pid} = MyApp.WorkerSup.register()
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:track, name, other_pid, meta}})
+    send_and_wait(rclock, {:track, name, other_pid, meta})
 
     assert entry(name: _, pid: ^other_pid, ref: _, meta: ^meta, clock: _) = Registry.get_by_name(name)
     refute Process.alive? pid
@@ -77,88 +77,89 @@ defmodule Swarm.TrackerTests do
 
   test "handle_replica_event :track with conflicting pid and local clock dominates, ignores the event", %{name: name, pid: pid, meta: meta, lclock: lclock, rclock: rclock} do
     lclock = Clock.event(lclock)
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(lclock), {:track, name, pid, meta}})
+    send_and_wait(lclock, {:track, name, pid, meta})
 
     {:ok, other_pid} = MyApp.WorkerSup.register()
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:track, name, other_pid, meta}})
+    send_and_wait(rclock, {:track, name, other_pid, meta})
 
     assert entry(name: _, pid: ^pid, ref: _, meta: ^meta, clock: _) = Registry.get_by_name(name)
     assert Process.alive? pid
   end
 
   test "handle_replica_event :untrack when remote clock dominates, removes registration", %{name: name, pid: pid, meta: meta, lclock: lclock, rclock: rclock} do
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(lclock), {:track, name, pid, meta}})
+    send_and_wait(lclock, {:track, name, pid, meta})
 
     rclock = Clock.event(rclock)
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:untrack, pid}})
+    send_and_wait(rclock, {:untrack, pid})
 
     assert :undefined = Registry.get_by_name(name)
   end
 
   test "handle_replica_event :untrack when local clock dominates, ignores event", %{name: name, pid: pid, meta: meta, lclock: lclock, rclock: rclock} do
     lclock = Clock.event(lclock)
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(lclock), {:track, name, pid, meta}})
+    send_and_wait(lclock, {:track, name, pid, meta})
 
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:untrack, pid}})
+    send_and_wait(rclock, {:untrack, pid})
 
     assert entry(name: _, pid: ^pid, ref: _, meta: ^meta, clock: _) = Registry.get_by_name(name)
   end
 
   test "handle_replica_event :untrack for unknown pid, ignores the event", %{name: name, pid: pid, meta: meta, lclock: lclock, rclock: rclock} do
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(lclock), {:track, name, pid, meta}})
+    send_and_wait(lclock, {:track, name, pid, meta})
 
     {:ok, other_pid} = MyApp.WorkerSup.register()
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:untrack, other_pid}})
+    send_and_wait(rclock, {:untrack, other_pid})
 
     assert entry(name: _, pid: ^pid, ref: _, meta: ^meta, clock: _) = Registry.get_by_name(name)
   end
 
   test "handle_replica_event :update_meta for unknown pid, ignores the event", %{name: name, pid: pid, meta: meta, lclock: lclock, rclock: rclock} do
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(lclock), {:track, name, pid, meta}})
+    send_and_wait(lclock, {:track, name, pid, meta})
 
     {:ok, other_pid} = MyApp.WorkerSup.register()
     other_meta = %{other: "meta"}
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:update_meta, other_meta, other_pid}})
+    send_and_wait(rclock, {:update_meta, other_meta, other_pid})
 
     assert entry(name: _, pid: ^pid, ref: _, meta: ^meta, clock: _) = Registry.get_by_name(name)
     assert :undefined = Registry.get_by_pid(other_pid)
   end
 
   test "handle_replica_event :update_meta when remote dominates, updates the registry", %{name: name, pid: pid, meta: meta, lclock: lclock, rclock: rclock} do
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(lclock), {:track, name, pid, meta}})
+    send_and_wait(lclock, {:track, name, pid, meta})
 
     rclock = Clock.event(rclock)
     new_meta = %{other: "meta"}
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:update_meta, new_meta, pid}})
+    send_and_wait(rclock, {:update_meta, new_meta, pid})
 
     assert entry(name: _, pid: ^pid, ref: _, meta: ^new_meta, clock: _) = Registry.get_by_name(name)
   end
 
   test "handle_replica_event :update_meta when local dominates, ignores the event", %{name: name, pid: pid, meta: meta, lclock: lclock, rclock: rclock} do
     lclock = Clock.event(lclock)
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(lclock), {:track, name, pid, meta}})
+    send_and_wait(lclock, {:track, name, pid, meta})
 
     new_meta = %{other: "meta"}
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:update_meta, new_meta, pid}})
+    send_and_wait(rclock, {:update_meta, new_meta, pid})
 
     assert entry(name: _, pid: ^pid, ref: _, meta: ^meta, clock: _) = Registry.get_by_name(name)
   end
 
   test "handle_replica_event :update_meta when conflict, merges the meta data", %{name: name, pid: pid, meta: meta, lclock: lclock, rclock: rclock} do
     lclock = Clock.event(lclock)
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(lclock), {:track, name, pid, meta}})
+    send_and_wait(lclock, {:track, name, pid, meta})
 
     rclock = Clock.event(rclock)
     new_meta = %{other: "meta"}
-    send_and_wait(Swarm.Tracker, {:event, self(), Clock.peek(rclock), {:update_meta, new_meta, pid}})
+    send_and_wait(rclock, {:update_meta, new_meta, pid})
 
     assert entry(name: _, pid: ^pid, ref: _, meta: updated_meta, clock: _) = Registry.get_by_name(name)
     assert updated_meta.mfa == {MyApp.WorkerSup, :register, []}
     assert updated_meta.other == "meta"
   end
 
-  defp send_and_wait(dest, message) do
-    send(dest, message)
-    :sys.get_state(dest)
+  defp send_and_wait(clock, event) do
+    message = {:event, self(), Clock.peek(clock), event}
+    send(Swarm.Tracker, message)
+    :sys.get_state(Swarm.Tracker)
   end
 end
